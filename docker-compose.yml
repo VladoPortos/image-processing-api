@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  image-processing-api:
+    build: .
+    container_name: image-processing-api
+    volumes:
+      - ./app:/app
+    ports:
+      - "8078:8000"
+    restart: unless-stopped
+    environment:
+      - PYTHONPATH=/app
