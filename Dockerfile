@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libjpeg-dev \
     zlib1g-dev \
+    curl \
+    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better layer caching
@@ -17,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # The app directory will be mounted as a volume
 # This is just a placeholder
-#COPY ./app /app
+COPY ./app /app/placeholder
 
 # Expose API port
 EXPOSE 8000

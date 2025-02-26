@@ -6,11 +6,17 @@ from io import BytesIO
 from typing import List, Optional
 import math
 import re
+import platform
+import sys
+import time
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import Response, JSONResponse
 from PIL import Image, ImageDraw, ImageFont, ExifTags
 import pillow_avif
+
+# Track API start time for uptime reporting
+START_TIME = time.time()
 
 app = FastAPI(
     title="Image Processing API",
@@ -24,6 +30,36 @@ ALLOWED_FORMATS = ["avif", "webp", "png", "jpg", "jpeg"]
 async def root():
     """Root endpoint"""
     return {"message": "Image Processing API is running"}
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint
+    
+    Returns information about the API's health and system information
+    """
+    uptime_seconds = time.time() - START_TIME
+    days, remainder = divmod(uptime_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    return {
+        "status": "healthy",
+        "version": "0.1.0",
+        "uptime": {
+            "days": int(days),
+            "hours": int(hours),
+            "minutes": int(minutes),
+            "seconds": int(seconds),
+            "total_seconds": int(uptime_seconds)
+        },
+        "system_info": {
+            "python_version": sys.version,
+            "platform": platform.platform(),
+            "pillow_version": Image.__version__,
+            "supported_formats": ALLOWED_FORMATS
+        }
+    }
 
 @app.post("/convert")
 async def convert_image(
@@ -233,18 +269,20 @@ async def extract_metadata(
 async def add_watermark(
     image: UploadFile = File(...),
     text: str = Form(...),
-    opacity: Optional[float] = Form(0.3),
-    density: Optional[int] = Form(20),  # Controls how many watermarks to place
+    opacity: Optional[float] = Form(0.5),
+    density: Optional[int] = Form(15),
+    font_size: Optional[int] = Form(None),
     format: str = Form(...),
     quality: Optional[int] = Form(85),
 ):
     """
-    Add a repeating text watermark across the image at 45 degrees
+    Add a repeating text watermark across the image with horizontal lines rotated 45 degrees
     
     - **image**: The image file to watermark
     - **text**: Text to use as watermark
-    - **opacity**: Watermark opacity (0.0-1.0), default is 0.3
-    - **density**: Controls watermark density (higher = more watermarks), default is 20
+    - **opacity**: Watermark opacity (0.0-1.0), default is 0.5
+    - **density**: Controls watermark density (1-50, higher = more watermarks), default is 15
+    - **font_size**: Custom font size in pixels, if not provided, calculated automatically based on image size
     - **format**: Output format (avif, webp, png, jpg)
     - **quality**: Quality setting (1-100), default is 85
     """
@@ -260,47 +298,101 @@ async def add_watermark(
     if not 0.0 <= opacity <= 1.0:
         raise HTTPException(status_code=400, detail="Opacity must be between 0.0 and 1.0")
     
+    # Validate density
+    if not 1 <= density <= 50:
+        raise HTTPException(status_code=400, detail="Density must be between 1 and 50")
+    
+    # Validate font size if provided
+    if font_size is not None and font_size <= 0:
+        raise HTTPException(status_code=400, detail="Font size must be greater than 0")
+    
     try:
         # Read the uploaded image
         contents = await image.read()
         img = Image.open(BytesIO(contents))
         
-        # Create a transparent overlay for the watermarks
-        txt_overlay = Image.new('RGBA', img.size, (255, 255, 255, 0))
-        draw = ImageDraw.Draw(txt_overlay)
-        
-        # Calculate diagonal length of the image
+        # Create a canvas larger than the image to account for rotation
+        # The canvas needs to be large enough so when rotated, it still covers the entire image
         diagonal = int(math.sqrt(img.width**2 + img.height**2))
+        canvas_size = (diagonal * 2, diagonal * 2)
         
-        # Calculate the size of the font based on the image size
-        font_size = max(img.width, img.height) // 20
+        # Create a transparent canvas
+        canvas = Image.new('RGBA', canvas_size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(canvas)
         
-        # Use a default font
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except IOError:
+        # Use custom font size if provided, otherwise calculate based on image size
+        if font_size is None:
+            font_size = max(img.width, img.height) // 20
+        
+        print(f"Using font size: {font_size}")  # Debug output
+        
+        # Try multiple fonts in order
+        font = None
+        for font_name in ["LiberationSans-Regular", "DejaVuSans", "arial"]:
+            try:
+                font = ImageFont.truetype(f"{font_name}.ttf", size=font_size)
+                print(f"Successfully loaded font: {font_name}")
+                break
+            except IOError:
+                continue
+        
+        # If all truetype fonts fail, use the default font as fallback
+        if font is None:
+            print("Warning: Using default font, size control may be limited")
             font = ImageFont.load_default()
-        
-        # Calculate the space between watermarks based on density
-        spacing = diagonal // density
-        
+            
         # Calculate text size for positioning
         textbbox = draw.textbbox((0, 0), text, font=font)
         text_width = textbbox[2] - textbbox[0]
         text_height = textbbox[3] - textbbox[1]
         
-        # Create multiple watermarks across the image
-        for i in range(-diagonal, diagonal * 2, spacing):
-            # Position text along the specified offset lines
-            position = (i - text_width // 2, (i * img.height // img.width) - text_height // 2)
+        # Calculate spacing based on density - higher density means smaller gaps
+        # Inverse relationship: spacing_factor = base_spacing / density
+        base_spacing = 45  # Base value for spacing
+        spacing_factor = base_spacing / density
+        
+        # Calculate gaps - ensure they're never smaller than the text itself
+        horizontal_gap = max(text_width * spacing_factor, text_width * 1.2)
+        vertical_gap = max(text_height * spacing_factor, text_height * 1.2)
+        
+        # Draw horizontal lines of text across the canvas
+        start_y = 0
+        while start_y < canvas_size[1]:
+            # Offset every other line for a more distributed pattern
+            offset = horizontal_gap / 2 if (start_y // vertical_gap) % 2 == 0 else 0
+            start_x = offset
             
-            # Draw the text at 45 degrees
-            draw.text(position, text, fill=(0, 0, 0, int(255 * opacity)), font=font, angle=45)
+            while start_x < canvas_size[0]:
+                draw.text((start_x, start_y), text, fill=(255, 255, 255, int(255 * opacity)), font=font)
+                start_x += horizontal_gap
+            
+            start_y += vertical_gap
+        
+        # Rotate the canvas by 45 degrees
+        rotated_canvas = canvas.rotate(45, resample=Image.BICUBIC, expand=False)
+        
+        # Calculate the position to paste the rotated canvas so it's centered on the image
+        paste_position = (
+            (img.width - rotated_canvas.width) // 2 + diagonal // 2,
+            (img.height - rotated_canvas.height) // 2 + diagonal // 2
+        )
+        
+        # Create a final transparent overlay the size of the original image
+        overlay = Image.new('RGBA', img.size, (255, 255, 255, 0))
+        
+        # Crop the relevant part of the rotated canvas and paste it onto the overlay
+        region = rotated_canvas.crop((
+            diagonal - img.width // 2,
+            diagonal - img.height // 2,
+            diagonal + img.width // 2,
+            diagonal + img.height // 2
+        ))
+        overlay.paste(region, (0, 0), region)
         
         # Composite the overlay with the original image
         if img.mode != 'RGBA':
             img = img.convert('RGBA')
-        watermarked = Image.alpha_composite(img, txt_overlay)
+        watermarked = Image.alpha_composite(img, overlay)
         
         # Convert back to original mode if needed for the output format
         if format.lower() in ["jpg", "jpeg"]:

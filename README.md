@@ -12,6 +12,7 @@ This API provides endpoints for converting images between different formats (AVI
 - Add diagonal watermarking text across images
 - Extract metadata and EXIF information from images
 - Get detailed information about potential image size savings
+- Health check endpoint with system information
 - Runs in Docker with Docker Compose
 - Development environment with hot-reload
 
@@ -131,12 +132,13 @@ docker-compose up -d
 **Parameters:**
 - `image`: The image file to watermark (multipart/form-data)
 - `text`: Text to use as watermark
-- `opacity`: Watermark opacity (0.0-1.0), default is 0.3
-- `density`: Controls watermark density (higher = more watermarks), default is 20
-- `format`: Target format (avif, webp, png, jpg)
+- `opacity`: Watermark opacity (0.0-1.0), default is 0.5
+- `density`: Controls watermark density (1-50, higher = more watermarks), default is 15
+- `font_size`: Custom font size in pixels (optional, calculated automatically if not provided)
+- `format`: Output format (avif, webp, png, jpg)
 - `quality`: Quality setting (1-100), default is 85
 
-**Response:** The watermarked image file
+**Response:** Watermarked image file
 
 ### 6. Extract Metadata
 **Endpoint:** `POST /metadata`
@@ -166,6 +168,32 @@ docker-compose up -d
     "FNumber": 5.6,
     "ISOSpeedRatings": 100,
     "FocalLength": 24.0
+  }
+}
+```
+
+### 7. Health Check
+**Endpoint:** `GET /health`
+
+**Parameters:** None
+
+**Response:** JSON with health status and system information
+```json
+{
+  "status": "healthy",
+  "version": "0.1.0",
+  "uptime": {
+    "days": 0,
+    "hours": 1,
+    "minutes": 23,
+    "seconds": 45,
+    "total_seconds": 5025
+  },
+  "system_info": {
+    "python_version": "3.11.0 (main, Oct 24 2022, 18:26:48) [GCC 10.2.1 20210110]",
+    "platform": "Linux-5.15.0-1035-aws-x86_64-with-glibc2.31",
+    "pillow_version": "10.0.0",
+    "supported_formats": ["avif", "webp", "png", "jpg", "jpeg"]
   }
 }
 ```
@@ -235,11 +263,12 @@ curl -X POST "http://localhost:8078/watermark" \
   -H "accept: application/json" \
   -H "Content-Type: multipart/form-data" \
   -F "image=@/path/to/your/image.jpg" \
-  -F "text=Copyright 2025" \
-  -F "opacity=0.3" \
-  -F "density=20" \
+  -F "text=CONFIDENTIAL" \
+  -F "opacity=0.5" \
+  -F "density=15" \
+  -F "font_size=36" \
   -F "format=webp" \
-  -F "quality=85" \
+  -F "quality=90" \
   --output image_watermarked.webp
 ```
 
@@ -249,6 +278,11 @@ curl -X POST "http://localhost:8078/metadata" \
   -H "accept: application/json" \
   -H "Content-Type: multipart/form-data" \
   -F "image=@/path/to/your/image.jpg"
+```
+
+For the health endpoint:
+```bash
+curl -X GET "http://localhost:8078/health"
 ```
 
 ## Development
