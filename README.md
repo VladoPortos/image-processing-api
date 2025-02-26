@@ -1,6 +1,8 @@
 # Image Processing API
 Docker image for processing images for resizing and format changes
 
+<a href='https://ko-fi.com/J3J52ZNN2' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi6.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+
 ## Overview
 This API provides endpoints for converting images between different formats (AVIF, WebP, PNG, JPG) with adjustable quality settings. It also offers multiple image processing capabilities like resizing, cropping, watermarking, and metadata extraction.
 
