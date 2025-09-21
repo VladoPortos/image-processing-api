@@ -11,10 +11,11 @@ import sys
 import time
 import base64
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Body
 from fastapi.responses import Response, JSONResponse
 from PIL import Image, ImageDraw, ImageFont, ExifTags
 import pillow_avif
+from pydantic import BaseModel
 
 # Track API start time for uptime reporting
 START_TIME = time.time()
@@ -26,6 +27,11 @@ app = FastAPI(
 )
 
 ALLOWED_FORMATS = ["avif", "webp", "png", "jpg", "jpeg"]
+
+class Base64ConvertRequest(BaseModel):
+    image_base64: str
+    format: str
+    quality: Optional[int] = 85
 
 @app.get("/")
 async def root():
@@ -123,29 +129,57 @@ async def convert_image(
  
 @app.post("/convert/base64")
 async def convert_image_base64(
-    image_base64: str = Form(...),
-    format: str = Form(...),
-    quality: Optional[int] = Form(85),
+    image_base64: Optional[str] = Form(None),
+    format: Optional[str] = Form(None),
+    quality: Optional[int] = Form(None),
+    payload: Optional[Base64ConvertRequest] = Body(None),
 ):
     """
     Convert a base64-encoded image to the specified format with the given quality
     
+    You can send parameters either as JSON or as form-data:
+    
+    JSON (recommended for large images):
+    {
+      "image_base64": "...",  
+      "format": "webp",        
+      "quality": 85             
+    }
+    
+    Or as form fields (may be limited by form parser size limits):
     - **image_base64**: Base64 string of the image. Accepts raw base64 or data URI
       (e.g., "data:image/png;base64,....")
     - **format**: Target format (avif, webp, png, jpg)
     - **quality**: Quality setting (1-100), default is 85
     """
+    # Prefer JSON payload if provided, otherwise use form fields
+    if payload is not None:
+        b64_input = payload.image_base64
+        target_format = payload.format
+        target_quality = payload.quality if payload.quality is not None else 85
+    else:
+        if image_base64 is None or format is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Provide either JSON body with image_base64, format, [quality] or form fields image_base64, format, [quality]"
+                ),
+            )
+        b64_input = image_base64
+        target_format = format
+        target_quality = 85 if quality is None else quality
+    
     # Validate format
-    if format.lower() not in ALLOWED_FORMATS:
+    if target_format.lower() not in ALLOWED_FORMATS:
         raise HTTPException(status_code=400, detail=f"Format must be one of {ALLOWED_FORMATS}")
     
     # Validate quality
-    if not 1 <= quality <= 100:
+    if not 1 <= int(target_quality) <= 100:
         raise HTTPException(status_code=400, detail="Quality must be between 1 and 100")
     
     try:
         # Handle data URI prefix if present
-        b64data = image_base64
+        b64data = b64_input
         if b64data.startswith("data:"):
             try:
                 b64data = b64data.split(",", 1)[1]
@@ -164,28 +198,28 @@ async def convert_image_base64(
         # Convert the image
         output = BytesIO()
         
-        if format.lower() in ["jpg", "jpeg"]:
+        if target_format.lower() in ["jpg", "jpeg"]:
             # JPG doesn't support alpha channel
             if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
                 background = Image.new('RGB', img.size, (255, 255, 255))
                 background.paste(img, mask=img.split()[3] if img.mode == 'RGBA' else None)
                 img = background
-            img.save(output, format="JPEG", quality=quality, optimize=True)
-        elif format.lower() == "png":
+            img.save(output, format="JPEG", quality=int(target_quality), optimize=True)
+        elif target_format.lower() == "png":
             img.save(output, format="PNG", optimize=True)
-        elif format.lower() == "webp":
-            img.save(output, format="WEBP", quality=quality)
-        elif format.lower() == "avif":
-            img.save(output, format="AVIF", quality=quality)
+        elif target_format.lower() == "webp":
+            img.save(output, format="WEBP", quality=int(target_quality))
+        elif target_format.lower() == "avif":
+            img.save(output, format="AVIF", quality=int(target_quality))
         
         # Use a default filename as base64 input doesn't include one
-        new_filename = f"converted.{format.lower()}"
+        new_filename = f"converted.{target_format.lower()}"
         
         # Return the converted image
         output.seek(0)
         return Response(
             content=output.getvalue(),
-            media_type=f"image/{format.lower()}",
+            media_type=f"image/{target_format.lower()}",
             headers={"Content-Disposition": f"attachment; filename={new_filename}"}
         )
     

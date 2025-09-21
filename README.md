@@ -52,6 +52,7 @@ docker-compose up -d
 **Notes:**
 - Input can be any supported image type encoded as base64 (e.g., PNG, JPG, etc.). If you include a Data URI prefix, it will be handled automatically.
 - The response is the converted image binary, with the appropriate `Content-Type` and `Content-Disposition` headers set for download.
+ - For large base64 strings, prefer sending `application/json` instead of form fields to avoid per-field size limits imposed by multipart parsers.
 
 **Response:** The converted image file
 
@@ -247,6 +248,19 @@ curl -X POST "http://localhost:8078/convert/base64" \
 ```
 
 Tip: You can omit the `data:image/png;base64,` prefix and send only the raw base64 string in `image_base64` if preferred.
+
+For the convert base64 endpoint using JSON (recommended for large images):
+```bash
+curl -X POST "http://localhost:8078/convert/base64" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image_base64": "REPLACE_WITH_BASE64_STRING",
+    "format": "webp",
+    "quality": 85
+  }' \
+  --output image.webp
+```
 
 For the info endpoint:
 ```bash
