@@ -10,8 +10,9 @@ import platform
 import sys
 import time
 import base64
+import json
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Body
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.responses import Response, JSONResponse
 from PIL import Image, ImageDraw, ImageFont, ExifTags
 import pillow_avif
@@ -128,12 +129,7 @@ async def convert_image(
         raise HTTPException(status_code=500, detail=f"Image processing error: {str(e)}")
  
 @app.post("/convert/base64")
-async def convert_image_base64(
-    image_base64: Optional[str] = Form(None),
-    format: Optional[str] = Form(None),
-    quality: Optional[int] = Form(None),
-    payload: Optional[Base64ConvertRequest] = Body(None),
-):
+async def convert_image_base64(request: Request):
     """
     Convert a base64-encoded image to the specified format with the given quality
     
@@ -152,28 +148,96 @@ async def convert_image_base64(
     - **format**: Target format (avif, webp, png, jpg)
     - **quality**: Quality setting (1-100), default is 85
     """
-    # Prefer JSON payload if provided, otherwise use form fields
-    if payload is not None:
-        b64_input = payload.image_base64
-        target_format = payload.format
-        target_quality = payload.quality if payload.quality is not None else 85
-    else:
-        if image_base64 is None or format is None:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Provide either JSON body with image_base64, format, [quality] or form fields image_base64, format, [quality]"
-                ),
-            )
-        b64_input = image_base64
-        target_format = format
-        target_quality = 85 if quality is None else quality
+    # Accept either JSON or form-data
+    content_type = request.headers.get("content-type", "")
+    b64_input = None
+    target_format = None
+    target_quality: Optional[int] = None
+    
+    try:
+        if "application/json" in content_type:
+            raw = await request.json()
+            # Validate with Pydantic model
+            data = Base64ConvertRequest(**raw)
+            b64_input = data.image_base64
+            target_format = data.format
+            target_quality = data.quality
+        elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+            form = await request.form()
+            b64_input = form.get("image_base64")
+            target_format = form.get("format")
+            q = form.get("quality")
+            target_quality = int(q) if q is not None and str(q).strip() != "" else 85
+        else:
+            # Try JSON as a fallback if content-type is missing or unusual
+            try:
+                raw = await request.json()
+                data = Base64ConvertRequest(**raw)
+                b64_input = data.image_base64
+                target_format = data.format
+                target_quality = data.quality
+            except Exception:
+                # Defer to raw body parsing below
+                pass
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request payload")
+    
+    # Final fallback: parse raw body (handles text/plain or JSON without headers)
+    if b64_input is None or target_format is None:
+        body_bytes = await request.body()
+        if body_bytes:
+            try:
+                raw_json = json.loads(body_bytes)
+                if isinstance(raw_json, dict):
+                    b64_candidate = raw_json.get("image_base64")
+                    fmt_candidate = raw_json.get("format")
+                    q_candidate = raw_json.get("quality")
+                    if b64_candidate is not None:
+                        b64_input = b64_candidate
+                    if fmt_candidate is not None:
+                        target_format = fmt_candidate
+                    if q_candidate is not None:
+                        try:
+                            target_quality = int(q_candidate)
+                        except Exception:
+                            pass
+                elif isinstance(raw_json, str):
+                    b64_input = raw_json
+            except Exception:
+                # Treat as text/plain base64 body with query params
+                try:
+                    body_str = body_bytes.decode('utf-8', errors='ignore').strip()
+                except Exception:
+                    body_str = None
+                if body_str:
+                    b64_input = body_str
+                    if target_format is None:
+                        target_format = request.query_params.get("format")
+                    if target_quality is None:
+                        q = request.query_params.get("quality")
+                        if q is not None and str(q).strip() != "":
+                            try:
+                                target_quality = int(q)
+                            except Exception:
+                                pass
+    
+    if b64_input is None or target_format is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Provide either JSON body with image_base64, format, [quality] or form fields image_base64, format, [quality]"
+            ),
+        )
     
     # Validate format
     if target_format.lower() not in ALLOWED_FORMATS:
         raise HTTPException(status_code=400, detail=f"Format must be one of {ALLOWED_FORMATS}")
     
     # Validate quality
+    if target_quality is None:
+        target_quality = 85
     if not 1 <= int(target_quality) <= 100:
         raise HTTPException(status_code=400, detail="Quality must be between 1 and 100")
     
