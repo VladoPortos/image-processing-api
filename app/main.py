@@ -9,6 +9,7 @@ import re
 import platform
 import sys
 import time
+import base64
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import Response, JSONResponse
@@ -119,7 +120,81 @@ async def convert_image(
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image processing error: {str(e)}")
-
+ 
+@app.post("/convert/base64")
+async def convert_image_base64(
+    image_base64: str = Form(...),
+    format: str = Form(...),
+    quality: Optional[int] = Form(85),
+):
+    """
+    Convert a base64-encoded image to the specified format with the given quality
+    
+    - **image_base64**: Base64 string of the image. Accepts raw base64 or data URI
+      (e.g., "data:image/png;base64,....")
+    - **format**: Target format (avif, webp, png, jpg)
+    - **quality**: Quality setting (1-100), default is 85
+    """
+    # Validate format
+    if format.lower() not in ALLOWED_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Format must be one of {ALLOWED_FORMATS}")
+    
+    # Validate quality
+    if not 1 <= quality <= 100:
+        raise HTTPException(status_code=400, detail="Quality must be between 1 and 100")
+    
+    try:
+        # Handle data URI prefix if present
+        b64data = image_base64
+        if b64data.startswith("data:"):
+            try:
+                b64data = b64data.split(",", 1)[1]
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid data URI for base64 image")
+        
+        # Remove whitespace/newlines before decoding
+        b64data = re.sub(r"\s", "", b64data)
+        try:
+            contents = base64.b64decode(b64data)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid base64 image data")
+        
+        img = Image.open(BytesIO(contents))
+        
+        # Convert the image
+        output = BytesIO()
+        
+        if format.lower() in ["jpg", "jpeg"]:
+            # JPG doesn't support alpha channel
+            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[3] if img.mode == 'RGBA' else None)
+                img = background
+            img.save(output, format="JPEG", quality=quality, optimize=True)
+        elif format.lower() == "png":
+            img.save(output, format="PNG", optimize=True)
+        elif format.lower() == "webp":
+            img.save(output, format="WEBP", quality=quality)
+        elif format.lower() == "avif":
+            img.save(output, format="AVIF", quality=quality)
+        
+        # Use a default filename as base64 input doesn't include one
+        new_filename = f"converted.{format.lower()}"
+        
+        # Return the converted image
+        output.seek(0)
+        return Response(
+            content=output.getvalue(),
+            media_type=f"image/{format.lower()}",
+            headers={"Content-Disposition": f"attachment; filename={new_filename}"}
+        )
+    
+    except HTTPException:
+        # Re-raise HTTPExceptions directly
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image processing error: {str(e)}")
+ 
 @app.post("/info")
 async def image_info(
     image: UploadFile = File(...),

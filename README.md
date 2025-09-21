@@ -41,6 +41,20 @@ docker-compose up -d
 
 **Response:** The converted image file
 
+### 1a. Convert Image (Base64)
+**Endpoint:** `POST /convert/base64`
+
+**Parameters:**
+- `image_base64`: Base64-encoded image string. Supports raw base64 or a Data URI such as `data:image/png;base64,......`
+- `format`: Target format (avif, webp, png, jpg)
+- `quality`: Quality setting (1-100), default is 85
+
+**Notes:**
+- Input can be any supported image type encoded as base64 (e.g., PNG, JPG, etc.). If you include a Data URI prefix, it will be handled automatically.
+- The response is the converted image binary, with the appropriate `Content-Type` and `Content-Disposition` headers set for download.
+
+**Response:** The converted image file
+
 ### 2. Image Information
 **Endpoint:** `POST /info`
 
@@ -220,6 +234,19 @@ curl -X POST "http://localhost:8078/convert" \
   -F "quality=85" \
   --output image.webp
 ```
+
+For the convert base64 endpoint (example with Data URI):
+```bash
+curl -X POST "http://localhost:8078/convert/base64" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "image_base64=data:image/png;base64,REPLACE_WITH_BASE64_STRING" \
+  --data-urlencode "format=webp" \
+  --data-urlencode "quality=85" \
+  --output image.webp
+```
+
+Tip: You can omit the `data:image/png;base64,` prefix and send only the raw base64 string in `image_base64` if preferred.
 
 For the info endpoint:
 ```bash
