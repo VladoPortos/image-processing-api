@@ -91,6 +91,8 @@ $RECYCLE.BIN/
 temp/
 uploads/
 processed/
+data/
+models/
 
 # Secrets
 *.pem

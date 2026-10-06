@@ -1,0 +1,6 @@
+# Build the ordinary CPU AI image first: docker compose build
+FROM image-processing-api:local AS classifier
+COPY requirements-ai.txt requirements-classify.txt /app/
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch==2.11.0+cpu --index-url https://download.pytorch.org/whl/cpu \
+    && pip install -r requirements-classify.txt

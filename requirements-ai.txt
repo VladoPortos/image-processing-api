@@ -1,0 +1,10 @@
+# Model-free CPU subset: provenance, registered visible marks, open DWT-DCT detection.
+# No diffusion, TrustMark, LaMa, MI-GAN, classifier or CUDA dependencies.
+remove-ai-watermarks[visible,detect]==0.45.0
+c2pa-python==0.38.0
+piexif==1.1.3
+opencv-python-headless==5.0.0.93
+numpy==2.4.6; python_version < "3.14"
+numpy==2.5.1; python_version >= "3.14"
+PyWavelets==1.9.0; python_version < "3.14"
+PyWavelets==1.10.0; python_version >= "3.14"

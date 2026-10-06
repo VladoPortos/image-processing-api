@@ -1,0 +1,13 @@
+services:
+  image-processing-api:
+    image: image-processing-api:classify
+    build:
+      context: .
+      dockerfile: Dockerfile.classify
+      target: classifier
+    environment:
+      - IMAGE_DATA_DIR=/data
+      - IMAGE_WORKERS=2
+      - IMAGE_API_ENABLE_CLASSIFIER=true
+      - RAIW_CLASSIFY_WEIGHTS=/models/photo-classifier
+      - HF_HUB_OFFLINE=1

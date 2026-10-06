@@ -1,789 +1,672 @@
-"""
-Image Processing API
-"""
+"""HTTP interface for local CPU image workflows."""
+
+import asyncio
+import json
+import logging
 import os
-from io import BytesIO
-from typing import List, Optional
-import math
-import re
 import platform
 import sys
 import time
-import base64
-import json
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Annotated
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
-from fastapi.responses import Response, JSONResponse
-from PIL import Image, ImageDraw, ImageFont, ExifTags
-import pillow_avif
-from pydantic import BaseModel
+from fastapi import FastAPI, File, Form, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
+from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException
+from PIL import Image
 
-# Track API start time for uptime reporting
-START_TIME = time.time()
-
-app = FastAPI(
-    title="Image Processing API",
-    description="API for processing images with various formats and quality settings",
-    version="0.1.0",
+from .artifacts import ArtifactStore
+from .core import (
+    MIME,
+    content_disposition,
+    decode_base64,
+    decode_image,
+    encode_image,
+    metadata_result,
+    output_filename,
 )
+from .errors import ImageError
+from .models import (
+    AICleanRequest,
+    AICleanResult,
+    AIClassifyRequest,
+    AIInspectRequest,
+    AIClassification,
+    AIInspection,
+    Capabilities,
+    ComparisonResult,
+    MetadataResult,
+    Artifact,
+    Base64ConvertRequest,
+    BatchRequest,
+    BatchResult,
+    CompareRequest,
+    ContactSheetRequest,
+    ContactSheetResult,
+    ErrorResponse,
+    Format,
+    InputReference,
+    InspectRequest,
+    Inspection,
+    OutputOptions,
+    ProcessRequest,
+    ProcessResult,
+    VariantsRequest,
+    VisionRequest,
+    VisionResult,
+)
+from .operations import OperationError, apply_operations
+from .workflows import compare, contact_sheet, prepare_vision, process
 
-ALLOWED_FORMATS = ["avif", "webp", "png", "jpg", "jpeg"]
-
-class Base64ConvertRequest(BaseModel):
-    image_base64: str
-    format: str
-    quality: Optional[int] = 85
-
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {"message": "Image Processing API is running"}
-
-@app.get("/health")
-async def health_check():
-    """
-    Health check endpoint
-    
-    Returns information about the API's health and system information
-    """
-    uptime_seconds = time.time() - START_TIME
-    days, remainder = divmod(uptime_seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    
-    return {
-        "status": "healthy",
-        "version": "0.1.0",
-        "uptime": {
-            "days": int(days),
-            "hours": int(hours),
-            "minutes": int(minutes),
-            "seconds": int(seconds),
-            "total_seconds": int(uptime_seconds)
+VERSION = "0.2.0"
+FORM_QUALITY = Annotated[int, Form(ge=1, le=100)]
+BINARY_RESPONSES = {
+    200: {
+        "description": "Encoded image bytes",
+        "content": {
+            mime: {"schema": {"type": "string", "format": "binary"}}
+            for mime in set(MIME.values())
         },
-        "system_info": {
-            "python_version": sys.version,
-            "platform": platform.platform(),
-            "pillow_version": Image.__version__,
-            "supported_formats": ALLOWED_FORMATS
-        }
     }
+}
+ERROR_RESPONSES = {
+    400: {"model": ErrorResponse},
+    404: {"model": ErrorResponse},
+    422: {"model": ErrorResponse},
+    503: {"model": ErrorResponse},
+}
+logger = logging.getLogger(__name__)
 
-@app.post("/convert")
-async def convert_image(
-    image: UploadFile = File(...),
-    format: str = Form(...),
-    quality: Optional[int] = Form(85),
-):
-    """
-    Convert an image to the specified format with the given quality
-    
-    - **image**: The image file to convert
-    - **format**: Target format (avif, webp, png, jpg)
-    - **quality**: Quality setting (1-100), default is 85
-    """
-    # Validate format
-    if format.lower() not in ALLOWED_FORMATS:
-        raise HTTPException(status_code=400, detail=f"Format must be one of {ALLOWED_FORMATS}")
-    
-    # Validate quality
-    if not 1 <= quality <= 100:
-        raise HTTPException(status_code=400, detail="Quality must be between 1 and 100")
-    
-    try:
-        # Read the uploaded image
-        contents = await image.read()
-        img = Image.open(BytesIO(contents))
-        
-        # Convert the image
-        output = BytesIO()
-        
-        if format.lower() in ["jpg", "jpeg"]:
-            # JPG doesn't support alpha channel
-            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                background.paste(img, mask=img.split()[3] if img.mode == 'RGBA' else None)
-                img = background
-            img.save(output, format="JPEG", quality=quality, optimize=True)
-        elif format.lower() == "png":
-            img.save(output, format="PNG", optimize=True)
-        elif format.lower() == "webp":
-            img.save(output, format="WEBP", quality=quality)
-        elif format.lower() == "avif":
-            img.save(output, format="AVIF", quality=quality)
-        
-        # Get original filename and replace extension
-        original_filename = image.filename
-        filename_base, _ = os.path.splitext(original_filename)
-        new_filename = f"{filename_base}.{format.lower()}"
-        
-        # Return the converted image
-        output.seek(0)
-        return Response(
-            content=output.getvalue(),
-            media_type=f"image/{format.lower()}",
-            headers={"Content-Disposition": f"attachment; filename={new_filename}"}
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Image processing error: {str(e)}")
- 
-@app.post("/convert/base64")
-async def convert_image_base64(request: Request):
-    """
-    Convert a base64-encoded image to the specified format with the given quality
-    
-    You can send parameters either as JSON or as form-data:
-    
-    JSON (recommended for large images):
-    {
-      "image_base64": "...",  
-      "format": "webp",        
-      "quality": 85             
-    }
-    
-    Or as form fields (may be limited by form parser size limits):
-    - **image_base64**: Base64 string of the image. Accepts raw base64 or data URI
-      (e.g., "data:image/png;base64,....")
-    - **format**: Target format (avif, webp, png, jpg)
-    - **quality**: Quality setting (1-100), default is 85
-    """
-    # Accept either JSON or form-data
-    content_type = request.headers.get("content-type", "")
-    b64_input = None
-    target_format = None
-    target_quality: Optional[int] = None
-    
-    try:
-        if "application/json" in content_type:
-            raw = await request.json()
-            # Validate with Pydantic model
-            data = Base64ConvertRequest(**raw)
-            b64_input = data.image_base64
-            target_format = data.format
-            target_quality = data.quality
-        elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
-            form = await request.form()
-            b64_input = form.get("image_base64")
-            target_format = form.get("format")
-            q = form.get("quality")
-            target_quality = int(q) if q is not None and str(q).strip() != "" else 85
-        else:
-            # Try JSON as a fallback if content-type is missing or unusual
-            try:
-                raw = await request.json()
-                data = Base64ConvertRequest(**raw)
-                b64_input = data.image_base64
-                target_format = data.format
-                target_quality = data.quality
-            except Exception:
-                # Defer to raw body parsing below
-                pass
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid request payload")
-    
-    # Final fallback: parse raw body (handles text/plain or JSON without headers)
-    if b64_input is None or target_format is None:
-        body_bytes = await request.body()
-        if body_bytes:
-            try:
-                raw_json = json.loads(body_bytes)
-                if isinstance(raw_json, dict):
-                    b64_candidate = raw_json.get("image_base64")
-                    fmt_candidate = raw_json.get("format")
-                    q_candidate = raw_json.get("quality")
-                    if b64_candidate is not None:
-                        b64_input = b64_candidate
-                    if fmt_candidate is not None:
-                        target_format = fmt_candidate
-                    if q_candidate is not None:
-                        try:
-                            target_quality = int(q_candidate)
-                        except Exception:
-                            pass
-                elif isinstance(raw_json, str):
-                    b64_input = raw_json
-            except Exception:
-                # Treat as text/plain base64 body with query params
-                try:
-                    body_str = body_bytes.decode('utf-8', errors='ignore').strip()
-                except Exception:
-                    body_str = None
-                if body_str:
-                    b64_input = body_str
-                    if target_format is None:
-                        target_format = request.query_params.get("format")
-                    if target_quality is None:
-                        q = request.query_params.get("quality")
-                        if q is not None and str(q).strip() != "":
-                            try:
-                                target_quality = int(q)
-                            except Exception:
-                                pass
-    
-    if b64_input is None or target_format is None:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Provide either JSON body with image_base64, format, [quality] or form fields image_base64, format, [quality]"
-            ),
-        )
-    
-    # Validate format
-    if target_format.lower() not in ALLOWED_FORMATS:
-        raise HTTPException(status_code=400, detail=f"Format must be one of {ALLOWED_FORMATS}")
-    
-    # Validate quality
-    if target_quality is None:
-        target_quality = 85
-    if not 1 <= int(target_quality) <= 100:
-        raise HTTPException(status_code=400, detail="Quality must be between 1 and 100")
-    
-    try:
-        # Handle data URI prefix if present
-        b64data = b64_input
-        if b64data.startswith("data:"):
-            try:
-                b64data = b64data.split(",", 1)[1]
-            except Exception:
-                raise HTTPException(status_code=400, detail="Invalid data URI for base64 image")
-        
-        # Remove whitespace/newlines before decoding
-        b64data = re.sub(r"\s", "", b64data)
-        try:
-            contents = base64.b64decode(b64data)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid base64 image data")
-        
-        img = Image.open(BytesIO(contents))
-        
-        # Convert the image
-        output = BytesIO()
-        
-        if target_format.lower() in ["jpg", "jpeg"]:
-            # JPG doesn't support alpha channel
-            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                background.paste(img, mask=img.split()[3] if img.mode == 'RGBA' else None)
-                img = background
-            img.save(output, format="JPEG", quality=int(target_quality), optimize=True)
-        elif target_format.lower() == "png":
-            img.save(output, format="PNG", optimize=True)
-        elif target_format.lower() == "webp":
-            img.save(output, format="WEBP", quality=int(target_quality))
-        elif target_format.lower() == "avif":
-            img.save(output, format="AVIF", quality=int(target_quality))
-        
-        # Use a default filename as base64 input doesn't include one
-        new_filename = f"converted.{target_format.lower()}"
-        
-        # Return the converted image
-        output.seek(0)
-        return Response(
-            content=output.getvalue(),
-            media_type=f"image/{target_format.lower()}",
-            headers={"Content-Disposition": f"attachment; filename={new_filename}"}
-        )
-    
-    except HTTPException:
-        # Re-raise HTTPExceptions directly
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Image processing error: {str(e)}")
- 
-@app.post("/info")
-async def image_info(
-    image: UploadFile = File(...),
-    quality: Optional[int] = Form(85),
-):
-    """
-    Get information about an image converted to all supported formats with given quality
-    
-    - **image**: The image file to analyze
-    - **quality**: Quality setting (1-100), default is 85
-    
-    Returns JSON with original size and size information for all supported formats
-    """
-    # Validate quality
-    if not 1 <= quality <= 100:
-        raise HTTPException(status_code=400, detail="Quality must be between 1 and 100")
-    
-    try:
-        # Read the uploaded image
-        contents = await image.read()
-        original_size = len(contents)
-        img = Image.open(BytesIO(contents))
-        
-        # Results for all formats
-        results = {
-            "original": {
-                "size_bytes": original_size,
-                "size_human": f"{original_size / 1024:.2f} KB",
-                "format": img.format,
-                "width": img.width,
-                "height": img.height,
-                "mode": img.mode,
-            },
-            "formats": {}
+
+def error_response(error):
+    return JSONResponse(
+        status_code=error.status_code,
+        content={"detail": error.message, "error": error.as_dict()},
+    )
+
+
+def validation_error(error):
+    details = [
+        {
+            "field": ".".join(str(part) for part in item["loc"]),
+            "message": item["msg"],
+            "type": item["type"],
         }
-        
-        # Process each format
-        for format in ["avif", "webp", "png", "jpg"]:
-            output = BytesIO()
-            
-            if format.lower() in ["jpg", "jpeg"]:
-                # JPG doesn't support alpha channel
-                if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-                    # Create a temporary image for JPG conversion with white background
-                    background = Image.new('RGB', img.size, (255, 255, 255))
-                    background.paste(img, mask=img.split()[3] if img.mode == 'RGBA' else None)
-                    temp_img = background
-                else:
-                    temp_img = img
-                temp_img.save(output, format="JPEG", quality=quality, optimize=True)
-            elif format.lower() == "png":
-                img.save(output, format="PNG", optimize=True)
-            elif format.lower() == "webp":
-                img.save(output, format="WEBP", quality=quality)
-            elif format.lower() == "avif":
-                img.save(output, format="AVIF", quality=quality)
-            
-            # Calculate sizes
-            output.seek(0)
-            converted_size = len(output.getvalue())
-            saved_bytes = original_size - converted_size
-            saved_percentage = (saved_bytes / original_size) * 100 if original_size > 0 else 0
-            
-            results["formats"][format] = {
-                "quality": quality,
-                "size_bytes": converted_size,
-                "size_human": f"{converted_size / 1024:.2f} KB",
-                "savings": {
-                    "bytes": saved_bytes,
-                    "percentage": f"{saved_percentage:.2f}%",
+        for item in error.errors()
+    ]
+    return ImageError(
+        "validation_error",
+        "Request parameters are invalid",
+        details=details,
+        status_code=422,
+    )
+
+
+def image_response(data, filename, format, warnings=None):
+    headers = {"Content-Disposition": content_disposition(filename)}
+    if warnings:
+        headers["X-Image-Warnings"] = ",".join(warnings)
+    return Response(data, media_type=MIME[format], headers=headers)
+
+
+def create_app(data_root: str | Path | None = None) -> FastAPI:
+    store = ArtifactStore(
+        data_root
+        or os.getenv(
+            "IMAGE_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")
+        )
+    )
+    worker_limit = max(1, int(os.getenv("IMAGE_WORKERS", "2")))
+    started = time.monotonic()
+
+    @asynccontextmanager
+    async def lifespan(application):
+        application.state.image_workers = asyncio.Semaphore(worker_limit)
+        yield
+
+    application = FastAPI(
+        title="Image Processing API",
+        version=VERSION,
+        lifespan=lifespan,
+        description="Local CPU image processing, reusable artifacts and agent workflows.",
+        responses=ERROR_RESPONSES,
+    )
+    application.state.store = store
+
+    async def work(function, *args, **kwargs):
+        async with application.state.image_workers:
+            return await run_in_threadpool(function, *args, **kwargs)
+
+    @application.exception_handler(ImageError)
+    async def handle_image_error(request, error):
+        return error_response(error)
+
+    @application.exception_handler(RequestValidationError)
+    @application.exception_handler(ValidationError)
+    async def handle_validation_error(request, error):
+        return error_response(validation_error(error))
+
+    @application.exception_handler(OperationError)
+    async def handle_operation_error(request, error):
+        return error_response(
+            ImageError(error.code, str(error), field=error.field, details=error.details)
+        )
+
+    @application.exception_handler(HTTPException)
+    async def handle_http_error(request, error):
+        return error_response(
+            ImageError("http_error", str(error.detail), status_code=error.status_code)
+        )
+
+    @application.exception_handler(Exception)
+    async def handle_internal_error(request, error):
+        logger.exception("Image request failed", exc_info=error)
+        return error_response(
+            ImageError("internal_error", "Image processing failed", status_code=500)
+        )
+
+    @application.get("/", operation_id="service_info")
+    async def root():
+        return {
+            "message": "Image Processing API is running",
+            "version": VERSION,
+            "docs": "/docs",
+        }
+
+    @application.get("/health", operation_id="health")
+    async def health():
+        uptime = int(time.monotonic() - started)
+        return {
+            "status": "healthy",
+            "version": VERSION,
+            "uptime": {
+                "days": uptime // 86400,
+                "hours": uptime // 3600 % 24,
+                "minutes": uptime // 60 % 60,
+                "seconds": uptime % 60,
+                "total_seconds": uptime,
+            },
+            "system_info": {
+                "python_version": sys.version,
+                "platform": platform.platform(),
+                "pillow_version": Image.__version__,
+                "supported_formats": list(MIME),
+            },
+        }
+
+    @application.get(
+        "/capabilities", response_model=Capabilities, operation_id="capabilities"
+    )
+    async def capabilities():
+        from .ai_service import capabilities as ai_capabilities
+
+        Image.init()
+        return {
+            "version": VERSION,
+            "formats": [
+                name
+                for name in MIME
+                if ("JPEG" if name in ("jpg", "jpeg") else name.upper()) in Image.SAVE
+            ],
+            "operations": [
+                "crop",
+                "resize",
+                "rotate",
+                "flip",
+                "pad",
+                "trim",
+                "flatten",
+                "watermark",
+            ],
+            "data_root": str(store.root),
+            "worker_limit": worker_limit,
+            "animation": "first_frame_only",
+            "ai": ai_capabilities(),
+        }
+
+    def binary_convert(data, filename, options, operations=(), suffix=""):
+        decoded = decode_image(data, filename)
+        for operation in operations:
+            if (
+                isinstance(operation, dict)
+                and operation.get("op") == "resize"
+                and operation.get("fit") == "stretch"
+                and operation.get("percentage") is None
+                and (
+                    operation.get("width") is not None
+                    or operation.get("height") is not None
+                )
+            ):
+                operation["width"] = operation.get("width") or decoded.image.width
+                operation["height"] = operation.get("height") or decoded.image.height
+        image, logs, warnings = apply_operations(decoded.image, list(operations))
+        encoded = encode_image(image, options, decoded.metadata)
+        return image_response(
+            encoded,
+            output_filename(filename, options.format, suffix),
+            options.format,
+            list(dict.fromkeys(decoded.warnings + warnings)),
+        )
+
+    @application.post(
+        "/convert",
+        response_class=Response,
+        responses=BINARY_RESPONSES,
+        operation_id="convert_image",
+    )
+    async def convert(
+        image: UploadFile = File(...),
+        format: str = Form(..., json_schema_extra={"enum": list(MIME)}),
+        quality: FORM_QUALITY = 85,
+    ):
+        return await work(
+            binary_convert,
+            await image.read(),
+            image.filename,
+            OutputOptions(format=format, quality=quality),
+        )
+
+    @application.post(
+        "/convert/base64",
+        response_class=Response,
+        responses=BINARY_RESPONSES,
+        operation_id="convert_base64",
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": Base64ConvertRequest.model_json_schema()
+                    }
+                },
+            }
+        },
+    )
+    async def convert_base64(request: Request):
+        content_type = request.headers.get("content-type", "")
+        try:
+            if "form" in content_type:
+                payload = dict(await request.form())
+            else:
+                body = await request.body()
+                try:
+                    payload = json.loads(body)
+                except (ValueError, UnicodeDecodeError):
+                    payload = {
+                        "image_base64": body.decode("utf-8"),
+                        "format": request.query_params.get("format"),
+                        "quality": request.query_params.get("quality", 85),
+                    }
+            parsed = Base64ConvertRequest.model_validate(payload)
+        except (UnicodeDecodeError, ValueError) as error:
+            if isinstance(error, ValidationError):
+                raise validation_error(error) from error
+            raise ImageError(
+                "invalid_request", "Invalid base64 conversion payload"
+            ) from error
+        return await work(
+            binary_convert,
+            decode_base64(parsed.image_base64),
+            "image",
+            OutputOptions(format=parsed.format, quality=parsed.quality),
+        )
+
+    @application.post(
+        "/resize",
+        response_class=Response,
+        responses=BINARY_RESPONSES,
+        operation_id="resize_image",
+    )
+    async def resize(
+        image: UploadFile = File(...),
+        format: str = Form(..., json_schema_extra={"enum": list(MIME)}),
+        quality: FORM_QUALITY = 85,
+        width: Annotated[int | None, Form(gt=0)] = None,
+        height: Annotated[int | None, Form(gt=0)] = None,
+        percentage: Annotated[float | None, Form(gt=0)] = None,
+        maintain_aspect_ratio: bool = Form(True),
+    ):
+        operation = {
+            "op": "resize",
+            "width": width,
+            "height": height,
+            "percentage": percentage,
+            "fit": "contain" if maintain_aspect_ratio else "stretch",
+            "allow_upscale": True,
+        }
+        return await work(
+            binary_convert,
+            await image.read(),
+            image.filename,
+            OutputOptions(format=format, quality=quality),
+            [operation],
+            "_resized",
+        )
+
+    @application.post(
+        "/crop",
+        response_class=Response,
+        responses=BINARY_RESPONSES,
+        operation_id="crop_image",
+    )
+    async def crop(
+        image: UploadFile = File(...),
+        format: str = Form(..., json_schema_extra={"enum": list(MIME)}),
+        quality: FORM_QUALITY = 85,
+        left: int = Form(...),
+        top: int = Form(...),
+        right: int = Form(...),
+        bottom: int = Form(...),
+    ):
+        return await work(
+            binary_convert,
+            await image.read(),
+            image.filename,
+            OutputOptions(format=format, quality=quality),
+            [
+                {
+                    "op": "crop",
+                    "left": left,
+                    "top": top,
+                    "right": right,
+                    "bottom": bottom,
+                }
+            ],
+            "_cropped",
+        )
+
+    @application.post(
+        "/watermark",
+        response_class=Response,
+        responses=BINARY_RESPONSES,
+        operation_id="watermark_image",
+    )
+    async def watermark(
+        image: UploadFile = File(...),
+        text: str = Form(...),
+        format: str = Form(..., json_schema_extra={"enum": list(MIME)}),
+        quality: FORM_QUALITY = 85,
+        opacity: Annotated[float, Form(ge=0, le=1)] = 0.5,
+        density: Annotated[int, Form(ge=1, le=50)] = 15,
+        font_size: Annotated[int | None, Form(gt=0)] = None,
+        color: str = Form("#ffffff"),
+        position: str = Form("repeated"),
+    ):
+        data = await image.read()
+
+        def apply():
+            decoded = decode_image(data, image.filename)
+            operation = {
+                "op": "watermark",
+                "text": text,
+                "opacity": opacity,
+                "density": density,
+                "font_size": font_size or max(1, max(decoded.image.size) // 20),
+                "color": color,
+                "position": position,
+            }
+            result, logs, warnings = apply_operations(decoded.image, [operation])
+            options = OutputOptions(format=format, quality=quality)
+            return image_response(
+                encode_image(result, options, decoded.metadata),
+                output_filename(image.filename, format, "_watermarked"),
+                format,
+                decoded.warnings + warnings,
+            )
+
+        return await work(apply)
+
+    @application.post(
+        "/metadata", response_model=MetadataResult, operation_id="image_metadata"
+    )
+    async def metadata(image: UploadFile = File(...)):
+        data = await image.read()
+        return await work(
+            lambda: metadata_result(decode_image(data, image.filename), image.filename)
+        )
+
+    @application.post(
+        "/info", response_model=ComparisonResult, operation_id="compare_uploaded_image"
+    )
+    async def info(
+        image: UploadFile = File(...),
+        quality: FORM_QUALITY = 85,
+        formats: list[Format] = Form(["avif", "webp", "png", "jpg"]),
+    ):
+        data = await image.read()
+        return await work(
+            lambda: compare(decode_image(data, image.filename), formats, quality)
+        )
+
+    @application.post("/images", response_model=Artifact, operation_id="upload_image")
+    async def upload_image(image: UploadFile = File(...)):
+        return await work(store.save, await image.read(), image.filename or "image")
+
+    @application.post(
+        "/images/base64", response_model=Artifact, operation_id="store_image"
+    )
+    async def store_image(request: InspectRequest):
+        def apply():
+            data, filename = store.resolve(request.input)
+            return store.save(data, filename)
+
+        return await work(apply)
+
+    @application.get(
+        "/artifacts/{artifact_id}",
+        response_class=Response,
+        responses=BINARY_RESPONSES,
+        operation_id="download_artifact",
+    )
+    async def download_artifact(artifact_id: str):
+        def apply():
+            descriptor = store.descriptor(artifact_id)
+            data, filename = store.resolve(InputReference(artifact_id=artifact_id))
+            return Response(
+                data,
+                media_type=descriptor.mime_type,
+                headers={"Content-Disposition": content_disposition(filename)},
+            )
+
+        return await work(apply)
+
+    @application.get(
+        "/artifacts/{artifact_id}/preview",
+        response_class=Response,
+        responses={
+            200: {
+                "content": {
+                    "image/png": {"schema": {"type": "string", "format": "binary"}}
                 }
             }
-            
-            # Explicitly clear the BytesIO object to free memory
-            output.close()
-        
-        # Make sure to explicitly delete temporary variables to free memory
-        del contents
-        del img
-        
-        return results
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Image processing error: {str(e)}")
-
-@app.post("/metadata")
-async def extract_metadata(
-    image: UploadFile = File(...),
-):
-    """
-    Extract metadata from an image
-    
-    - **image**: The image file to analyze
-    
-    Returns JSON with all available metadata
-    """
-    try:
-        # Read the uploaded image
-        contents = await image.read()
-        img = Image.open(BytesIO(contents))
-        
-        # Basic image info
-        metadata = {
-            "filename": image.filename,
-            "format": img.format,
-            "mode": img.mode,
-            "size": {
-                "width": img.width,
-                "height": img.height,
-            },
-            "info": {}
-        }
-        
-        # Add image info dictionary
-        for key, value in img.info.items():
-            if isinstance(value, (str, int, float, bool, list, dict)) and key != "exif":
-                metadata["info"][key] = value
-        
-        # Extract EXIF data if available
-        exif_data = {}
-        if hasattr(img, '_getexif') and img._getexif() is not None:
-            exif = img._getexif()
-            for tag_id, value in exif.items():
-                tag = ExifTags.TAGS.get(tag_id, tag_id)
-                # Handle binary data and other non-serializable types
-                if isinstance(value, (bytes, bytearray)):
-                    value = "binary data"
-                elif not isinstance(value, (str, int, float, bool, list, dict, tuple)) or isinstance(value, tuple) and not all(isinstance(i, (str, int, float, bool)) for i in value):
-                    try:
-                        value = str(value)
-                    except:
-                        value = "unserializable data"
-                exif_data[tag] = value
-                
-            metadata["exif"] = exif_data
-        
-        # Make sure to explicitly delete temporary variables to free memory
-        del contents
-        del img
-        
-        return metadata
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Metadata extraction error: {str(e)}")
-
-@app.post("/watermark")
-async def add_watermark(
-    image: UploadFile = File(...),
-    text: str = Form(...),
-    opacity: Optional[float] = Form(0.5),
-    density: Optional[int] = Form(15),
-    font_size: Optional[int] = Form(None),
-    format: str = Form(...),
-    quality: Optional[int] = Form(85),
-):
-    """
-    Add a repeating text watermark across the image with horizontal lines rotated 45 degrees
-    
-    - **image**: The image file to watermark
-    - **text**: Text to use as watermark
-    - **opacity**: Watermark opacity (0.0-1.0), default is 0.5
-    - **density**: Controls watermark density (1-50, higher = more watermarks), default is 15
-    - **font_size**: Custom font size in pixels, if not provided, calculated automatically based on image size
-    - **format**: Output format (avif, webp, png, jpg)
-    - **quality**: Quality setting (1-100), default is 85
-    """
-    # Validate format
-    if format.lower() not in ALLOWED_FORMATS:
-        raise HTTPException(status_code=400, detail=f"Format must be one of {ALLOWED_FORMATS}")
-    
-    # Validate quality
-    if not 1 <= quality <= 100:
-        raise HTTPException(status_code=400, detail="Quality must be between 1 and 100")
-    
-    # Validate opacity
-    if not 0.0 <= opacity <= 1.0:
-        raise HTTPException(status_code=400, detail="Opacity must be between 0.0 and 1.0")
-    
-    # Validate density
-    if not 1 <= density <= 50:
-        raise HTTPException(status_code=400, detail="Density must be between 1 and 50")
-    
-    # Validate font size if provided
-    if font_size is not None and font_size <= 0:
-        raise HTTPException(status_code=400, detail="Font size must be greater than 0")
-    
-    try:
-        # Read the uploaded image
-        contents = await image.read()
-        img = Image.open(BytesIO(contents))
-        
-        # Create a canvas larger than the image to account for rotation
-        # The canvas needs to be large enough so when rotated, it still covers the entire image
-        diagonal = int(math.sqrt(img.width**2 + img.height**2))
-        canvas_size = (diagonal * 2, diagonal * 2)
-        
-        # Create a transparent canvas
-        canvas = Image.new('RGBA', canvas_size, (255, 255, 255, 0))
-        draw = ImageDraw.Draw(canvas)
-        
-        # Use custom font size if provided, otherwise calculate based on image size
-        if font_size is None:
-            font_size = max(img.width, img.height) // 20
-        
-        print(f"Using font size: {font_size}")  # Debug output
-        
-        # Try multiple fonts in order
-        font = None
-        for font_name in ["LiberationSans-Regular", "DejaVuSans", "arial"]:
-            try:
-                font = ImageFont.truetype(f"{font_name}.ttf", size=font_size)
-                print(f"Successfully loaded font: {font_name}")
-                break
-            except IOError:
-                continue
-        
-        # If all truetype fonts fail, use the default font as fallback
-        if font is None:
-            print("Warning: Using default font, size control may be limited")
-            font = ImageFont.load_default()
-            
-        # Calculate text size for positioning
-        textbbox = draw.textbbox((0, 0), text, font=font)
-        text_width = textbbox[2] - textbbox[0]
-        text_height = textbbox[3] - textbbox[1]
-        
-        # Calculate spacing based on density - higher density means smaller gaps
-        # Inverse relationship: spacing_factor = base_spacing / density
-        base_spacing = 45  # Base value for spacing
-        spacing_factor = base_spacing / density
-        
-        # Calculate gaps - ensure they're never smaller than the text itself
-        horizontal_gap = max(text_width * spacing_factor, text_width * 1.2)
-        vertical_gap = max(text_height * spacing_factor, text_height * 1.2)
-        
-        # Draw horizontal lines of text across the canvas
-        start_y = 0
-        while start_y < canvas_size[1]:
-            # Offset every other line for a more distributed pattern
-            offset = horizontal_gap / 2 if (start_y // vertical_gap) % 2 == 0 else 0
-            start_x = offset
-            
-            while start_x < canvas_size[0]:
-                draw.text((start_x, start_y), text, fill=(255, 255, 255, int(255 * opacity)), font=font)
-                start_x += horizontal_gap
-            
-            start_y += vertical_gap
-        
-        # Rotate the canvas by 45 degrees
-        rotated_canvas = canvas.rotate(45, resample=Image.BICUBIC, expand=False)
-        
-        # Calculate the position to paste the rotated canvas so it's centered on the image
-        paste_position = (
-            (img.width - rotated_canvas.width) // 2 + diagonal // 2,
-            (img.height - rotated_canvas.height) // 2 + diagonal // 2
-        )
-        
-        # Create a final transparent overlay the size of the original image
-        overlay = Image.new('RGBA', img.size, (255, 255, 255, 0))
-        
-        # Crop the relevant part of the rotated canvas and paste it onto the overlay
-        region = rotated_canvas.crop((
-            diagonal - img.width // 2,
-            diagonal - img.height // 2,
-            diagonal + img.width // 2,
-            diagonal + img.height // 2
-        ))
-        overlay.paste(region, (0, 0), region)
-        
-        # Composite the overlay with the original image
-        if img.mode != 'RGBA':
-            img = img.convert('RGBA')
-        watermarked = Image.alpha_composite(img, overlay)
-        
-        # Convert back to original mode if needed for the output format
-        if format.lower() in ["jpg", "jpeg"]:
-            watermarked = watermarked.convert('RGB')
-        
-        # Save the watermarked image
-        output = BytesIO()
-        
-        if format.lower() in ["jpg", "jpeg"]:
-            watermarked.save(output, format="JPEG", quality=quality, optimize=True)
-        elif format.lower() == "png":
-            watermarked.save(output, format="PNG", optimize=True)
-        elif format.lower() == "webp":
-            watermarked.save(output, format="WEBP", quality=quality)
-        elif format.lower() == "avif":
-            watermarked.save(output, format="AVIF", quality=quality)
-        
-        # Get original filename and replace extension
-        original_filename = image.filename
-        filename_base, _ = os.path.splitext(original_filename)
-        new_filename = f"{filename_base}_watermarked.{format.lower()}"
-        
-        # Return the watermarked image
-        output.seek(0)
-        return Response(
-            content=output.getvalue(),
-            media_type=f"image/{format.lower()}",
-            headers={"Content-Disposition": f"attachment; filename={new_filename}"}
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Watermarking error: {str(e)}")
-
-@app.post("/resize")
-async def resize_image(
-    image: UploadFile = File(...),
-    width: Optional[int] = Form(None),
-    height: Optional[int] = Form(None),
-    percentage: Optional[float] = Form(None),
-    maintain_aspect_ratio: Optional[bool] = Form(True),
-    format: str = Form(...),
-    quality: Optional[int] = Form(85),
-):
-    """
-    Resize an image to the specified dimensions or by percentage
-    
-    - **image**: The image file to resize
-    - **width**: Target width in pixels (optional)
-    - **height**: Target height in pixels (optional)
-    - **percentage**: Scale by percentage, e.g., 50 for half size (optional)
-    - **maintain_aspect_ratio**: Whether to maintain aspect ratio, default is True
-    - **format**: Output format (avif, webp, png, jpg)
-    - **quality**: Quality setting (1-100), default is 85
-    """
-    # Validate format
-    if format.lower() not in ALLOWED_FORMATS:
-        raise HTTPException(status_code=400, detail=f"Format must be one of {ALLOWED_FORMATS}")
-    
-    # Validate quality
-    if not 1 <= quality <= 100:
-        raise HTTPException(status_code=400, detail="Quality must be between 1 and 100")
-    
-    # Validate resize parameters - at least one must be provided
-    if width is None and height is None and percentage is None:
-        raise HTTPException(
-            status_code=400, 
-            detail="At least one of width, height, or percentage must be provided"
-        )
-    
-    try:
-        # Read the uploaded image
-        contents = await image.read()
-        img = Image.open(BytesIO(contents))
-        
-        original_width, original_height = img.size
-        
-        # Calculate new dimensions
-        if percentage is not None:
-            # Resize by percentage
-            new_width = int(original_width * percentage / 100)
-            new_height = int(original_height * percentage / 100)
-        elif width is not None and height is not None:
-            # Use both width and height
-            if maintain_aspect_ratio:
-                # Calculate which dimension to fit within while maintaining aspect ratio
-                width_ratio = width / original_width
-                height_ratio = height / original_height
-                ratio = min(width_ratio, height_ratio)
-                new_width = int(original_width * ratio)
-                new_height = int(original_height * ratio)
-            else:
-                # Use exact dimensions
-                new_width = width
-                new_height = height
-        elif width is not None:
-            # Only width specified, maintain aspect ratio
-            ratio = width / original_width
-            new_width = width
-            new_height = int(original_height * ratio) if maintain_aspect_ratio else original_height
-        elif height is not None:
-            # Only height specified, maintain aspect ratio
-            ratio = height / original_height
-            new_height = height
-            new_width = int(original_width * ratio) if maintain_aspect_ratio else original_width
-        
-        # Apply resize
-        resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
-        # Save the resized image
-        output = BytesIO()
-        
-        if format.lower() in ["jpg", "jpeg"]:
-            # JPG doesn't support alpha channel
-            if resized_img.mode in ('RGBA', 'LA') or (resized_img.mode == 'P' and 'transparency' in resized_img.info):
-                background = Image.new('RGB', resized_img.size, (255, 255, 255))
-                background.paste(resized_img, mask=resized_img.split()[3] if resized_img.mode == 'RGBA' else None)
-                resized_img = background
-            resized_img.save(output, format="JPEG", quality=quality, optimize=True)
-        elif format.lower() == "png":
-            resized_img.save(output, format="PNG", optimize=True)
-        elif format.lower() == "webp":
-            resized_img.save(output, format="WEBP", quality=quality)
-        elif format.lower() == "avif":
-            resized_img.save(output, format="AVIF", quality=quality)
-        
-        # Get original filename and replace extension
-        original_filename = image.filename
-        filename_base, _ = os.path.splitext(original_filename)
-        new_filename = f"{filename_base}_resized.{format.lower()}"
-        
-        # Return the resized image
-        output.seek(0)
-        return Response(
-            content=output.getvalue(),
-            media_type=f"image/{format.lower()}",
-            headers={"Content-Disposition": f"attachment; filename={new_filename}"}
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Resize error: {str(e)}")
-
-@app.post("/crop")
-async def crop_image(
-    image: UploadFile = File(...),
-    left: int = Form(...),
-    top: int = Form(...),
-    right: int = Form(...),
-    bottom: int = Form(...),
-    format: str = Form(...),
-    quality: Optional[int] = Form(85),
-):
-    """
-    Crop an image to the specified region
-    
-    - **image**: The image file to crop
-    - **left**: Left coordinate for cropping
-    - **top**: Top coordinate for cropping
-    - **right**: Right coordinate for cropping
-    - **bottom**: Bottom coordinate for cropping
-    - **format**: Output format (avif, webp, png, jpg)
-    - **quality**: Quality setting (1-100), default is 85
-    """
-    # Validate format
-    if format.lower() not in ALLOWED_FORMATS:
-        raise HTTPException(status_code=400, detail=f"Format must be one of {ALLOWED_FORMATS}")
-    
-    # Validate quality
-    if not 1 <= quality <= 100:
-        raise HTTPException(status_code=400, detail="Quality must be between 1 and 100")
-    
-    try:
-        # Read the uploaded image
-        contents = await image.read()
-        img = Image.open(BytesIO(contents))
-        
-        # Validate crop coordinates
-        if left < 0 or top < 0 or right > img.width or bottom > img.height or left >= right or top >= bottom:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid crop coordinates. Image dimensions are {img.width}x{img.height}."
+        },
+        operation_id="preview_artifact",
+    )
+    async def preview_artifact(
+        artifact_id: str, max_edge: Annotated[int, Query(ge=1, le=2048)] = 512
+    ):
+        def apply():
+            data, filename = store.resolve(InputReference(artifact_id=artifact_id))
+            decoded = decode_image(data, filename)
+            decoded.image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+            return Response(
+                encode_image(
+                    decoded.image, OutputOptions(format="png", metadata="strip")
+                ),
+                media_type="image/png",
             )
-        
-        # Apply the crop
-        cropped_img = img.crop((left, top, right, bottom))
-        
-        # Save the cropped image
-        output = BytesIO()
-        
-        if format.lower() in ["jpg", "jpeg"]:
-            # JPG doesn't support alpha channel
-            if cropped_img.mode in ('RGBA', 'LA') or (cropped_img.mode == 'P' and 'transparency' in cropped_img.info):
-                background = Image.new('RGB', cropped_img.size, (255, 255, 255))
-                background.paste(cropped_img, mask=cropped_img.split()[3] if cropped_img.mode == 'RGBA' else None)
-                cropped_img = background
-            cropped_img.save(output, format="JPEG", quality=quality, optimize=True)
-        elif format.lower() == "png":
-            cropped_img.save(output, format="PNG", optimize=True)
-        elif format.lower() == "webp":
-            cropped_img.save(output, format="WEBP", quality=quality)
-        elif format.lower() == "avif":
-            cropped_img.save(output, format="AVIF", quality=quality)
-        
-        # Get original filename and replace extension
-        original_filename = image.filename
-        filename_base, _ = os.path.splitext(original_filename)
-        new_filename = f"{filename_base}_cropped.{format.lower()}"
-        
-        # Return the cropped image
-        output.seek(0)
-        return Response(
-            content=output.getvalue(),
-            media_type=f"image/{format.lower()}",
-            headers={"Content-Disposition": f"attachment; filename={new_filename}"}
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Crop error: {str(e)}")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+        return await work(apply)
+
+    @application.post(
+        "/inspect", response_model=Inspection, operation_id="inspect_image"
+    )
+    async def inspect_image(request: InspectRequest):
+        def apply():
+            data, filename = store.resolve(request.input)
+            return decode_image(data, filename).inspection
+
+        return await work(apply)
+
+    @application.post(
+        "/compare", response_model=ComparisonResult, operation_id="compare_formats"
+    )
+    async def compare_formats(request: CompareRequest):
+        def apply():
+            data, filename = store.resolve(request.input)
+            return compare(
+                decode_image(data, filename), request.formats, request.quality
+            )
+
+        return await work(apply)
+
+    @application.post(
+        "/process", response_model=ProcessResult, operation_id="process_image"
+    )
+    async def process_image(request: ProcessRequest):
+        return await work(process, store, request)
+
+    @application.post(
+        "/variants", response_model=BatchResult, operation_id="create_variants"
+    )
+    async def variants(request: VariantsRequest):
+        def apply():
+            data, filename = store.resolve(request.input)
+            decoded = decode_image(data, filename)
+            results = []
+            for index, variant in enumerate(request.variants):
+                try:
+                    result = process(
+                        store,
+                        ProcessRequest(
+                            input=request.input,
+                            operations=variant.operations,
+                            output=variant.output,
+                        ),
+                        decoded,
+                        filename,
+                    )
+                    results.append(
+                        {
+                            "index": index,
+                            "name": variant.name,
+                            "status": "success",
+                            "result": result,
+                        }
+                    )
+                except ImageError as error:
+                    results.append(
+                        {
+                            "index": index,
+                            "name": variant.name,
+                            "status": "error",
+                            "error": error.as_dict(),
+                        }
+                    )
+            return {"results": results}
+
+        return await work(apply)
+
+    @application.post(
+        "/batch", response_model=BatchResult, operation_id="process_batch"
+    )
+    async def batch(request: BatchRequest):
+        def apply():
+            results = []
+            for index, job in enumerate(request.jobs):
+                try:
+                    results.append(
+                        {
+                            "index": index,
+                            "status": "success",
+                            "result": process(store, job),
+                        }
+                    )
+                except ImageError as error:
+                    results.append(
+                        {"index": index, "status": "error", "error": error.as_dict()}
+                    )
+            return {"results": results}
+
+        return await work(apply)
+
+    @application.post(
+        "/contact-sheet",
+        response_model=ContactSheetResult,
+        operation_id="contact_sheet",
+    )
+    async def create_contact_sheet(request: ContactSheetRequest):
+        return await work(contact_sheet, store, request)
+
+    @application.post(
+        "/prepare-vision", response_model=VisionResult, operation_id="prepare_vision"
+    )
+    async def vision(request: VisionRequest):
+        return await work(prepare_vision, store, request)
+
+    def ai_call(function_name, source, **kwargs):
+        from . import ai_service
+
+        data, filename = store.resolve(source)
+        try:
+            return getattr(ai_service, function_name)(data, filename, **kwargs)
+        except ai_service.AIServiceError as error:
+            raise ImageError(
+                error.code,
+                error.message,
+                details=getattr(error, "details", None),
+                status_code=error.status_code,
+            ) from error
+
+    @application.post(
+        "/ai/inspect", response_model=AIInspection, operation_id="inspect_ai_provenance"
+    )
+    async def ai_inspect(request: AIInspectRequest):
+        return await work(
+            ai_call,
+            "inspect_ai",
+            request.input,
+            check_visible=request.check_visible,
+            check_invisible=request.check_invisible,
+        )
+
+    @application.post(
+        "/ai/classify",
+        response_model=AIClassification,
+        operation_id="classify_ai_photo",
+    )
+    async def ai_classify(request: AIClassifyRequest):
+        return await work(ai_call, "classify_ai", request.input, domain=request.domain)
+
+    @application.post(
+        "/ai/clean", response_model=AICleanResult, operation_id="clean_ai_marks"
+    )
+    async def ai_clean(request: AICleanRequest):
+        def apply():
+            result = ai_call(
+                "clean_ai",
+                request.input,
+                visible=request.visible,
+                metadata=request.metadata,
+            )
+            data = result.pop("data")
+            decoded = decode_image(data)
+            original_filename = store.resolve(request.input)[1]
+            filename = output_filename(
+                original_filename, decoded.inspection["format"], "_cleaned"
+            )
+            result["artifact"] = store.save(
+                data, filename, warnings=result.get("warnings"), decoded=decoded
+            )
+            return result
+
+        return await work(apply)
+
+    return application
+
+
+app = create_app()

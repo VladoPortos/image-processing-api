@@ -1,0 +1,5 @@
+# Optional stdio adapter; install alongside the repository checkout.
+mcp==1.26.0
+httpx==0.28.1
+pydantic>=2.11,<3
+pillow>=11.1,<13

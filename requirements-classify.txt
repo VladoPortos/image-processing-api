@@ -1,0 +1,18 @@
+# Optional photo-only classifier. Install CPU PyTorch explicitly FIRST:
+# python -m pip install torch==2.11.0+cpu --index-url https://download.pytorch.org/whl/cpu
+# Then: python -m pip install -r requirements-classify.txt
+# Cache weights outside requests from wiltodelta/raiw-photo-classify revision
+# de668f0d8a53412923478cc21382a56890748310, set RAIW_CLASSIFY_WEIGHTS to
+# that local directory, and set IMAGE_API_ENABLE_CLASSIFIER=true.
+# Required files: clip-l-ft.pt, probe-weights-clip-l-ft.npz, detector.pt, provider.pt.
+# Also cache config.json and preprocessor_config.json from the pinned snapshot of
+# openai/clip-vit-large-patch14 revision 32bd64288804d66eefd0ccbe215aa642df71cc41
+# in the same directory. The service loads CLIP's
+# configuration from this local directory, preventing from_pretrained downloads.
+# Optional files: operating-point.json, receipt-gate.npz.
+-r requirements-ai.txt
+transformers==5.15.0
+tokenizers==0.22.2
+huggingface-hub==1.33.0
+# Keep pip from selecting a default CUDA torch wheel when resolving dependencies.
+torch==2.11.0+cpu
